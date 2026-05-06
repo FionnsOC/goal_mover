@@ -135,7 +135,7 @@ class GoalMoverNode(Node):
         self.declare_parameter('linear_decel',            0.6)
         self.declare_parameter('angular_rate_deg_per_cm', 1.0)
         self.declare_parameter('angular_deadband',        0.02)
-        self.declare_parameter('xy_goal_tolerance',       0.10)   # raised to 10 cm
+        self.declare_parameter('xy_goal_tolerance',       0.15)   # 15 cm to handle end-of-path drift
         self.declare_parameter('yaw_goal_tolerance',      0.05)
         self.declare_parameter('control_rate',           20.0)
 
@@ -265,21 +265,60 @@ class GoalMoverNode(Node):
         orange_error = wrap_angle(path_yaw - start_yaw)
         blue_error   = wrap_angle(goal_yaw  - path_yaw)
 
-        orange_dist = abs(math.degrees(orange_error)) / self.angular_rate_deg_per_cm / 100.0
-        blue_dist   = abs(math.degrees(blue_error))   / self.angular_rate_deg_per_cm / 100.0
+        # Distance each rotation requires at the configured rate.
+        # k [rad/m] = angular_rate_deg_per_cm * pi/180 * 100
+        k = self.angular_rate_deg_per_cm * (math.pi / 180.0) * 100.0
+
+        theta_o = abs(orange_error)   # rad, magnitude only
+        theta_b = abs(blue_error)     # rad, magnitude only
+
+        orange_dist = theta_o / k    # metres needed for orange
+        blue_dist   = theta_b / k    # metres needed for blue
 
         orange_sign = 1.0 if orange_error >= 0.0 else -1.0
         blue_sign   = 1.0 if blue_error   >= 0.0 else -1.0
-        orange_end  = orange_dist
 
         overlapping = (orange_dist + blue_dist) > path_length
-        blue_start  = orange_dist if overlapping else (path_length - blue_dist)
+
+        if not overlapping:
+            # Normal case: orange finishes, optional coast, blue starts.
+            orange_end = orange_dist
+            blue_start = path_length - blue_dist
+            switch_angle_deg = None
+        else:
+            # Overlap case: solve for the intersection point s* where the
+            # remaining orange rotation equals the remaining blue rotation.
+            #
+            #   s* = L/2 + (theta_o - theta_b) / (2*k)
+            #
+            # Derivation: at s*, set remaining orange = remaining blue:
+            #   theta_o - k*s* = theta_b - k*(L - s*)
+            #   => s* = L/2 + (theta_o - theta_b) / (2*k)
+            #
+            # Clamp to [0, L] to handle extreme cases where one rotation is
+            # so much larger that the switch would be outside the path.
+            s_star = path_length / 2.0 + (theta_o - theta_b) / (2.0 * k)
+            s_star = max(0.0, min(path_length, s_star))
+
+            # Angle at the switch point (how far orange has progressed).
+            angle_star = theta_o - k * s_star   # rad remaining in orange dir
+            angle_star = max(0.0, angle_star)   # clamp, should not go negative
+
+            orange_end  = s_star
+            blue_start  = s_star   # hard switch: blue starts exactly where orange ends
+            switch_angle_deg = math.degrees(angle_star)
 
         self.get_logger().info(
             f'[GoalMover] Angles | '
             f'orange={math.degrees(orange_error):.1f} deg ({orange_dist:.3f} m) | '
             f'blue={math.degrees(blue_error):.1f} deg ({blue_dist:.3f} m)'
         )
+        if overlapping:
+            self.get_logger().info(
+                f'[GoalMover] Overlap | '
+                f's*={orange_end:.3f} m | '
+                f'angle at switch={switch_angle_deg:.1f} deg'
+            )
 
         return AngularSchedule(
             orange_end=orange_end,
@@ -352,12 +391,25 @@ class GoalMoverNode(Node):
             vx = vy = 0.0
 
         # Angular profile
-        if xy_dist < self.xy_goal_tolerance:
-            # XY done -- pure heading correction at constant rate
-            wz = 0.0 if abs(yaw_error) < self.angular_deadband else math.copysign(
-                self.angular_rate_deg_per_cm * (math.pi / 180.0) * 100.0 * self.desired_linear_vel,
-                yaw_error,
-            )
+        # When the linear profile has finished (speed==0 near end of path) or
+        # the robot is already within xy_goal_tolerance, switch to a direct
+        # yaw correction at a fixed rate independent of speed.
+        # If odometry drift pushed xy_dist back above tolerance while speed==0,
+        # also re-enable a slow translation correction so the robot creeps back.
+        at_xy_goal      = xy_dist < self.xy_goal_tolerance
+        linear_finished = (speed == 0.0 and s >= self.path_length * 0.99)
+
+        if at_xy_goal or linear_finished:
+            wz_rate = (self.angular_rate_deg_per_cm * (math.pi / 180.0)
+                       * 100.0 * self.desired_linear_vel)
+            wz = (0.0 if abs(yaw_error) < self.angular_deadband
+                  else math.copysign(wz_rate, yaw_error))
+            # Re-enable slow translation if drift pushed us outside tolerance.
+            if not at_xy_goal and bd > 1e-6:
+                correction_speed = min(self.desired_linear_vel * 0.5,
+                                       xy_dist * 2.0)
+                vx = (bx / bd) * correction_speed
+                vy = (by / bd) * correction_speed
         else:
             wz = self.angular_schedule.evaluate(
                 s, speed, self.angular_rate_deg_per_cm, self.angular_deadband)
