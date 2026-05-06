@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+            schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>goal_mover</name>
+  <version>0.1.0</version>
+  <description>
+    Standalone ROS 2 node that drives a holonomic robot to a PoseStamped goal
+    without the nav2 stack, using a trapezoidal linear profile and a
+    distance-scheduled rectangular angular profile (orange + blue).
+  </description>
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
