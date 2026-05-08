@@ -275,16 +275,24 @@ class GoalMoverNode(Node):
         orange_dist = theta_o / k    # metres needed for orange
         blue_dist   = theta_b / k    # metres needed for blue
 
+        # orange_sign: direction to rotate from start_yaw onto path_yaw.
+        # Use signum of wrap(path_yaw - start_yaw) — shortest turn.
         orange_sign = 1.0 if orange_error >= 0.0 else -1.0
-        blue_sign   = 1.0 if blue_error   >= 0.0 else -1.0
 
         overlapping = (orange_dist + blue_dist) > path_length
 
         if not overlapping:
-            # Normal case: orange finishes, optional coast, blue starts.
+            # Normal case: orange finishes at path_yaw, then optional coast,
+            # then blue starts.
             orange_end = orange_dist
             blue_start = path_length - blue_dist
             switch_angle_deg = None
+
+            # blue_sign: direction from path_yaw to goal_yaw.
+            # Recompute via signum(wrap(goal_yaw - path_yaw)) to avoid the
+            # +-180 deg floating-point boundary that flips the sign.
+            blue_sign = 1.0 if wrap_angle(goal_yaw - path_yaw) >= 0.0 else -1.0
+
         else:
             # Overlap case: solve for the intersection point s* where the
             # remaining orange rotation equals the remaining blue rotation.
@@ -307,6 +315,14 @@ class GoalMoverNode(Node):
             orange_end  = s_star
             blue_start  = s_star   # hard switch: blue starts exactly where orange ends
             switch_angle_deg = math.degrees(angle_star)
+
+            # blue_sign: shortest turn from the actual heading at the switch
+            # point to goal_yaw.  This is the key fix: in the overlap case the
+            # robot is NOT at path_yaw when blue starts, so we must compute the
+            # direction from the real heading at s*, not from path_yaw.
+            # This also avoids the +-180 deg floating-point boundary issue.
+            heading_at_switch = start_yaw + orange_sign * (theta_o - angle_star)
+            blue_sign = 1.0 if wrap_angle(goal_yaw - heading_at_switch) >= 0.0 else -1.0
 
         self.get_logger().info(
             f'[GoalMover] Angles | '
