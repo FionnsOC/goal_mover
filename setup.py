@@ -23,7 +23,8 @@ setup(
     license='BSD-3-Clause',
     entry_points={
         'console_scripts': [
-            'goal_mover_node = goal_mover.goal_mover_node:main',
+            'goal_mover_node      = goal_mover.goal_mover_node:main',
+            'goal_mover_node_rviz = goal_mover.goal_mover_node_rviz:main',
         ],
     },
 )

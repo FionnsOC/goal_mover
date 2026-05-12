@@ -36,7 +36,7 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
@@ -130,7 +130,7 @@ class AngularSchedule:
 class GoalMoverNode(Node):
 
     def __init__(self):
-        super().__init__('goal_mover_node')
+        super().__init__('goal_mover_rviz_node')
 
         # Parameters
         self.declare_parameter('desired_linear_vel',      0.2)
@@ -141,6 +141,7 @@ class GoalMoverNode(Node):
         self.declare_parameter('xy_goal_tolerance',       0.15)   # 15 cm to handle end-of-path drift
         self.declare_parameter('yaw_goal_tolerance',      0.05)
         self.declare_parameter('control_rate',           20.0)
+        self.declare_parameter('csv_filename',            '')
 
         self.desired_linear_vel      = self.get_parameter('desired_linear_vel').value
         self.linear_accel            = self.get_parameter('linear_accel').value
@@ -150,6 +151,7 @@ class GoalMoverNode(Node):
         self.xy_goal_tolerance       = self.get_parameter('xy_goal_tolerance').value
         self.yaw_goal_tolerance      = self.get_parameter('yaw_goal_tolerance').value
         self.control_rate            = self.get_parameter('control_rate').value
+        self.csv_filename            = self.get_parameter('csv_filename').value
 
         # Odometry state
         self.robot_x   = 0.0
@@ -163,43 +165,41 @@ class GoalMoverNode(Node):
         self.path_length    = 0.0
         self.goal_start_x   = 0.0
         self.goal_start_y   = 0.0
+        self.goal_dx        = 0.0   # relative offset to goal (goal - start)
+        self.goal_dy        = 0.0
+        self.goal_yaw       = 0.0   # desired final heading (rad)
         self.current_speed  = 0.0
         self.last_tick_time = None
 
-        # CSV logging — one file per goal, written to ~/goal_mover_logs/
+        # ── CSV LOGGER: state ────────────────────────────────────────────────
         self._csv_file   = None
         self._csv_writer = None
         self._csv_t0     = 0.0   # time of first tick for this goal (seconds)
         log_dir = os.path.expanduser('~/goal_mover_logs')
         os.makedirs(log_dir, exist_ok=True)
         self._log_dir = log_dir
+        # ── END CSV LOGGER: state ─────────────────────────────────────────
 
-        # QoS profiles
-        # goal_pose: transient-local so a goal published before this node
-        # started is replayed immediately -- fixes the "no movement" race.
-        goal_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            depth=1,
-        )
-        odom_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
-
+        # Subscriptions.
+        # /goal_pose: plain depth=10 matches RViz '2D Goal Pose' defaults
+        #             (Reliable + Volatile).  No custom QoS object needed.
+        # /odom:      must be BEST_EFFORT to match the robot driver publisher.
+        #             This is the only reason a QoS object is needed here --
+        #             removing it would cause a silent DDS incompatibility and
+        #             the node would never receive odometry.
         self.goal_sub = self.create_subscription(
-            PoseStamped, '/goal_pose', self._goal_callback, goal_qos)
+            PoseStamped, '/goal_pose_rviz', self._goal_callback, 10)
         self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self._odom_callback, odom_qos)
+            Odometry, '/odom', self._odom_callback,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       history=HistoryPolicy.KEEP_LAST, depth=10))
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
         period_s = 1.0 / self.control_rate
         self.timer = self.create_timer(period_s, self._control_loop)
 
         self.get_logger().info(
-            f'[GoalMover] Ready. '
+            f'[GoalMover RViz] Ready. '
             f'angular_rate={self.angular_rate_deg_per_cm} deg/cm  '
             f'linear_vel={self.desired_linear_vel} m/s  '
             f'rate={self.control_rate} Hz'
@@ -207,6 +207,7 @@ class GoalMoverNode(Node):
 
     # -------------------------------------------------------------------------
 
+    # ── CSV LOGGER: close helper ─────────────────────────────────────────────
     def _close_csv(self):
         """Flush and close the current CSV log file if one is open."""
         if self._csv_file is not None:
@@ -214,6 +215,7 @@ class GoalMoverNode(Node):
             self._csv_file.close()
             self._csv_file   = None
             self._csv_writer = None
+    # ── END CSV LOGGER: close helper ─────────────────────────────────────────
 
     # -------------------------------------------------------------------------
 
@@ -246,32 +248,36 @@ class GoalMoverNode(Node):
         self.current_speed = 0.05   # bootstrap above v_min so profile escapes zero
         self.last_tick_time = None
 
-        # Close any previous CSV and open a fresh one for this goal.
+        # ── CSV LOGGER: open file on new goal ────────────────────────────────
         self._close_csv()
-        stamp = time.strftime('%Y%m%d_%H%M%S')
-        csv_path = os.path.join(self._log_dir, f'goal_{stamp}.csv')
+        if self.csv_filename:
+            name = self.csv_filename if self.csv_filename.endswith('.csv')                    else self.csv_filename + '.csv'
+        else:
+            name = f'goal_{time.strftime("%Y%m%d_%H%M%S")}.csv'
+        csv_path = os.path.join(self._log_dir, name)
         self._csv_file   = open(csv_path, 'w', newline='')
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow(
             ['t_s', 's_m', 'path_length_m', 'xy_dist_m',
              'vx_mps', 'vy_mps', 'wz_radps',
              'speed_mps', 'robot_yaw_deg', 'phase'])
-        self._csv_t0 = 0.0   # will be set on first tick
+        self._csv_t0 = 0.0
         self.get_logger().info(f'[GoalMover] Logging to {csv_path}')
+        # ── END CSV LOGGER: open file on new goal ─────────────────────────
 
+        # Store goal as relative offset from current robot position.
+        # This makes the node frame-agnostic: it works correctly regardless
+        # of where the odom origin is (Gazebo world coords vs RViz (0,0)).
         goal_x   = msg.pose.position.x
         goal_y   = msg.pose.position.y
-        goal_yaw = quat_to_yaw(msg.pose.orientation)
+        self.goal_dx  = goal_x - self.goal_start_x
+        self.goal_dy  = goal_y - self.goal_start_y
+        self.goal_yaw = quat_to_yaw(msg.pose.orientation)
+        goal_yaw = self.goal_yaw
 
-        self.path_length = math.hypot(
-            goal_x - self.goal_start_x,
-            goal_y - self.goal_start_y,
-        )
+        self.path_length = math.hypot(self.goal_dx, self.goal_dy)
 
-        path_yaw = math.atan2(
-            goal_y - self.goal_start_y,
-            goal_x - self.goal_start_x,
-        )
+        path_yaw = math.atan2(self.goal_dy, self.goal_dx)
 
         self.angular_schedule = self._build_schedule(
             start_yaw=self.robot_yaw,
@@ -395,13 +401,11 @@ class GoalMoverNode(Node):
                 dt = 1.0 / self.control_rate
         self.last_tick_time = now
 
-        # Goal geometry
-        goal_x   = self.goal.pose.position.x
-        goal_y   = self.goal.pose.position.y
-        goal_yaw = quat_to_yaw(self.goal.pose.orientation)
-
-        dx      = goal_x - self.robot_x
-        dy      = goal_y - self.robot_y
+        # Goal geometry — computed from relative offset so odom origin does
+        # not matter (works with both Gazebo world coords and RViz (0,0)).
+        goal_yaw = self.goal_yaw
+        dx      = (self.goal_start_x + self.goal_dx) - self.robot_x
+        dy      = (self.goal_start_y + self.goal_dy) - self.robot_y
         xy_dist = math.hypot(dx, dy)
 
         # s: distance travelled along path from start, clamped to path_length
@@ -419,7 +423,9 @@ class GoalMoverNode(Node):
                 f'xy_dist={xy_dist:.4f} m  yaw_err={math.degrees(yaw_error):.2f} deg'
             )
             self.cmd_vel_pub.publish(Twist())
+            # ── CSV LOGGER: close on goal reached ────────────────────────
             self._close_csv()
+            # ── END CSV LOGGER: close on goal reached ────────────────────
             self.goal = None
             self.current_speed = 0.0
             return
@@ -471,13 +477,12 @@ class GoalMoverNode(Node):
         cmd.angular.z = wz
         self.cmd_vel_pub.publish(cmd)
 
-        # CSV logging
+        # ── CSV LOGGER: write row ────────────────────────────────────────────
         if self._csv_writer is not None:
             t_now = self.get_clock().now().nanoseconds * 1e-9
             if self._csv_t0 == 0.0:
                 self._csv_t0 = t_now
             t_rel = t_now - self._csv_t0
-
             if at_xy_goal or linear_finished:
                 phase = 'goal_heading'
             elif s < self.angular_schedule.orange_end:
@@ -486,19 +491,12 @@ class GoalMoverNode(Node):
                 phase = 'blue'
             else:
                 phase = 'coast'
-
             self._csv_writer.writerow([
-                f'{t_rel:.4f}',
-                f'{s:.4f}',
-                f'{self.path_length:.4f}',
-                f'{xy_dist:.4f}',
-                f'{vx:.4f}',
-                f'{vy:.4f}',
-                f'{wz:.4f}',
-                f'{speed:.4f}',
-                f'{math.degrees(self.robot_yaw):.2f}',
-                phase,
+                f'{t_rel:.4f}', f'{s:.4f}', f'{self.path_length:.4f}',
+                f'{xy_dist:.4f}', f'{vx:.4f}', f'{vy:.4f}', f'{wz:.4f}',
+                f'{speed:.4f}', f'{math.degrees(self.robot_yaw):.2f}', phase,
             ])
+        # ── END CSV LOGGER: write row ─────────────────────────────────────
 
         self.get_logger().info(
             f's={s:.3f}/{self.path_length:.3f} m | xy={xy_dist:.3f} m | '
@@ -516,7 +514,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # ── CSV LOGGER: close on shutdown ────────────────────────────────
         node._close_csv()
+        # ── END CSV LOGGER: close on shutdown ────────────────────────────
         node.destroy_node()
         rclpy.shutdown()
 
